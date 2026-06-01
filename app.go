@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -13,10 +14,19 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/skip2/go-qrcode"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
+
+type Message struct {
+	Sender    string `json:"sender"`
+	Content   string `json:"content"`
+	Timestamp string `json:"timestamp"`
+	IsSharer  bool   `json:"isSharer"`
+}
 
 type App struct {
 	ctx        context.Context
@@ -25,11 +35,16 @@ type App struct {
 	isSharing  bool
 	shareURL   string
 	localIP    string
+	messages   []Message
+	maxMessages int
+	msgMutex   sync.Mutex
 }
 
 func NewApp() *App {
 	return &App{
-		shareDir: `D:\共享`,
+		shareDir:    `D:\共享`,
+		messages:    make([]Message, 0),
+		maxMessages: 50,
 	}
 }
 
@@ -106,6 +121,9 @@ func (a *App) StartSharing() string {
 	mux.HandleFunc("/files/", a.handleFileDownload)
 	mux.HandleFunc("/upload", a.handleUpload)
 	mux.HandleFunc("/api/list", a.handleFileList)
+	mux.HandleFunc("/api/messages", a.handleMessages)
+	mux.HandleFunc("/api/message", a.handleMessage)
+	mux.HandleFunc("/api/myip", a.handleMyIP)
 
 	a.server = &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
@@ -357,6 +375,100 @@ func formatSize(size int64) string {
 	return fmt.Sprintf("%.1f GB", float64(size)/(1024*1024*1024))
 }
 
+func (a *App) GetMessages() string {
+	a.msgMutex.Lock()
+	defer a.msgMutex.Unlock()
+	data, _ := json.Marshal(a.messages)
+	return string(data)
+}
+
+func (a *App) SendMessage(content string) string {
+	a.msgMutex.Lock()
+	defer a.msgMutex.Unlock()
+	
+	msg := Message{
+		Sender:    "共享者",
+		Content:   content,
+		Timestamp: time.Now().Format("15:04"),
+		IsSharer:  true,
+	}
+	a.messages = append(a.messages, msg)
+	
+	if len(a.messages) > a.maxMessages {
+		a.messages = a.messages[len(a.messages)-a.maxMessages:]
+	}
+	return ""
+}
+
+func (a *App) ClearMessages() string {
+	a.msgMutex.Lock()
+	defer a.msgMutex.Unlock()
+	a.messages = make([]Message, 0)
+	return ""
+}
+
+func (a *App) GetMessageCount() int {
+	a.msgMutex.Lock()
+	defer a.msgMutex.Unlock()
+	return len(a.messages)
+}
+
+func (a *App) handleMessages(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(a.GetMessages()))
+}
+
+func (a *App) handleMessage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	var req struct {
+		Name    string `json:"name"`
+		Content string `json:"content"`
+		IP      string `json:"ip"`
+	}
+	
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+	
+	a.msgMutex.Lock()
+	sender := req.Name
+	if sender == "" {
+		sender = req.IP
+	} else if req.IP != "" {
+		sender = fmt.Sprintf("%s(%s)", req.Name, req.IP)
+	}
+	
+	msg := Message{
+		Sender:    sender,
+		Content:   req.Content,
+		Timestamp: time.Now().Format("15:04"),
+		IsSharer:  false,
+	}
+	a.messages = append(a.messages, msg)
+	
+	if len(a.messages) > a.maxMessages {
+		a.messages = a.messages[len(a.messages)-a.maxMessages:]
+	}
+	a.msgMutex.Unlock()
+	
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"success":true}`))
+}
+
+func (a *App) handleMyIP(w http.ResponseWriter, r *http.Request) {
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		ip = r.RemoteAddr
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(fmt.Sprintf(`{"ip":"%s"}`, ip)))
+}
+
 var indexHTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -566,13 +678,201 @@ var indexHTML = `<!DOCTYPE html>
             margin-top: 8px;
             text-align: center;
         }
+        .header-wrapper {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            margin-bottom: 24px;
+        }
+        .msg-icon-btn {
+            position: relative;
+            width: 36px;
+            height: 36px;
+            border: none;
+            border-radius: 8px;
+            background: #fff;
+            color: #6b7280;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .msg-icon-btn:hover {
+            background: #f0f3ff;
+            color: #4f6ef7;
+        }
+        .msg-badge {
+            position: absolute;
+            top: -4px;
+            right: -4px;
+            min-width: 18px;
+            height: 18px;
+            padding: 0 4px;
+            background: #ef4444;
+            color: #fff;
+            font-size: 11px;
+            font-weight: 600;
+            border-radius: 9px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .dialog-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.4);
+            z-index: 1000;
+            display: none;
+            align-items: center;
+            justify-content: center;
+        }
+        .dialog-overlay.show {
+            display: flex;
+        }
+        .dialog-content {
+            width: 380px;
+            max-height: 450px;
+            background: #fff;
+            border-radius: 12px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.15);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .dialog-header {
+            padding: 14px 18px;
+            border-bottom: 1px solid #e8ecf3;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .dialog-header h3 {
+            font-size: 15px;
+            font-weight: 600;
+            color: #1a1a2e;
+        }
+        .dialog-close {
+            width: 28px;
+            height: 28px;
+            border: none;
+            background: none;
+            color: #9ca3af;
+            font-size: 20px;
+            cursor: pointer;
+            border-radius: 4px;
+        }
+        .dialog-close:hover {
+            background: #f3f4f6;
+            color: #374151;
+        }
+        .dialog-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 14px;
+        }
+        .message-list {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .no-messages {
+            text-align: center;
+            color: #9ca3af;
+            font-size: 13px;
+            padding: 30px;
+        }
+        .message-item {
+            padding: 10px 12px;
+            background: #f8fafc;
+            border-radius: 8px;
+        }
+        .message-item.is-sharer {
+            background: #f0f3ff;
+        }
+        .msg-sender {
+            font-size: 12px;
+            font-weight: 600;
+            color: #4f6ef7;
+        }
+        .msg-content {
+            font-size: 13px;
+            color: #374151;
+            margin: 4px 0;
+            word-break: break-all;
+        }
+        .msg-time {
+            font-size: 11px;
+            color: #9ca3af;
+        }
+        .dialog-footer {
+            padding: 14px;
+            border-top: 1px solid #e8ecf3;
+        }
+        .name-input-row {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 10px;
+        }
+        .name-input {
+            flex: 1;
+            padding: 8px 12px;
+            border: 1px solid #e2e5ec;
+            border-radius: 6px;
+            font-size: 13px;
+            outline: none;
+        }
+        .name-input:focus {
+            border-color: #4f6ef7;
+        }
+        .msg-input-row {
+            display: flex;
+            gap: 8px;
+        }
+        .msg-input {
+            flex: 1;
+            padding: 8px 12px;
+            border: 1px solid #e2e5ec;
+            border-radius: 6px;
+            font-size: 13px;
+            outline: none;
+        }
+        .msg-input:focus {
+            border-color: #4f6ef7;
+        }
+        .msg-send-btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 6px;
+            background: #4f6ef7;
+            color: #fff;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+        }
+        .msg-send-btn:hover {
+            background: #4358d9;
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <div class="header">
-            <h1>📁 局域网文件共享</h1>
-            <p>点击文件下载，或拖拽文件到上传区域</p>
+        <div class="header-wrapper">
+            <div class="header">
+                <h1>📁 局域网文件共享</h1>
+                <p>点击文件下载，或拖拽文件到上传区域</p>
+            </div>
+            <button class="msg-icon-btn" id="msgIconBtn" onclick="openMessageDialog()">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+                </svg>
+                <span class="msg-badge" id="msgBadge" style="display:none">0</span>
+            </button>
         </div>
 
         <div class="upload-section">
@@ -608,6 +908,27 @@ var indexHTML = `<!DOCTYPE html>
         </div>
     </div>
 
+    <div class="dialog-overlay" id="messageDialog">
+        <div class="dialog-content">
+            <div class="dialog-header">
+                <h3>📢 消息板</h3>
+                <button class="dialog-close" onclick="closeMessageDialog()">×</button>
+            </div>
+            <div class="dialog-body">
+                <div class="message-list" id="messageList"></div>
+            </div>
+            <div class="dialog-footer">
+                <div class="name-input-row">
+                    <input type="text" class="name-input" id="nameInput" placeholder="你的名字（可选，默认使用IP）">
+                </div>
+                <div class="msg-input-row">
+                    <input type="text" class="msg-input" id="msgInput" placeholder="输入消息..." onkeyup="if(event.keyCode===13)sendMessage()">
+                    <button class="msg-send-btn" onclick="sendMessage()">发送</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script>
         const uploadArea = document.getElementById('uploadArea');
         const fileInput = document.getElementById('fileInput');
@@ -615,6 +936,14 @@ var indexHTML = `<!DOCTYPE html>
         const uploadProgress = document.getElementById('uploadProgress');
         const progressFill = document.getElementById('progressFill');
         const progressText = document.getElementById('progressText');
+        const messageDialog = document.getElementById('messageDialog');
+        const messageList = document.getElementById('messageList');
+        const msgBadge = document.getElementById('msgBadge');
+        const nameInput = document.getElementById('nameInput');
+        const msgInput = document.getElementById('msgInput');
+        let myIP = '';
+        
+        nameInput.value = localStorage.getItem('visitorName') || '';
 
         uploadArea.addEventListener('click', () => fileInput.click());
 
@@ -722,6 +1051,78 @@ var indexHTML = `<!DOCTYPE html>
 
         loadFiles();
         setInterval(loadFiles, 5000);
+        
+        getMyIP();
+        loadMessages();
+        setInterval(loadMessages, 3000);
+        
+        async function getMyIP() {
+            try {
+                const res = await fetch('/api/myip');
+                const data = await res.json();
+                myIP = data.ip;
+            } catch (e) {}
+        }
+        
+        function openMessageDialog() {
+            messageDialog.classList.add('show');
+        }
+        
+        function closeMessageDialog() {
+            messageDialog.classList.remove('show');
+        }
+        
+        async function loadMessages() {
+            try {
+                const res = await fetch('/api/messages');
+                const messages = await res.json();
+                renderMessages(messages);
+                updateBadge(messages.length);
+            } catch (e) {}
+        }
+        
+        function renderMessages(messages) {
+            if (messages.length === 0) {
+                messageList.innerHTML = '<div class="no-messages">暂无消息</div>';
+                return;
+            }
+            messageList.innerHTML = messages.map(m => 
+                '<div class="message-item' + (m.isSharer ? ' is-sharer' : '') + '">' +
+                '<div class="msg-sender">' + m.sender + '</div>' +
+                '<div class="msg-content">' + m.content + '</div>' +
+                '<div class="msg-time">' + m.timestamp + '</div>' +
+                '</div>'
+            ).join('');
+        }
+        
+        function updateBadge(count) {
+            if (count > 0) {
+                msgBadge.textContent = count > 99 ? '99+' : count;
+                msgBadge.style.display = 'flex';
+            } else {
+                msgBadge.style.display = 'none';
+            }
+        }
+        
+        async function sendMessage() {
+            const content = msgInput.value.trim();
+            if (!content) return;
+            
+            const name = nameInput.value.trim();
+            if (name) {
+                localStorage.setItem('visitorName', name);
+            }
+            
+            try {
+                await fetch('/api/message', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: name, content: content, ip: myIP })
+                });
+                msgInput.value = '';
+                await loadMessages();
+            } catch (e) {}
+        }
     </script>
 </body>
 </html>`

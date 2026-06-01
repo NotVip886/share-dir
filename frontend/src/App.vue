@@ -14,7 +14,11 @@ import {
   CopyShareURL,
   OpenInBrowser,
   UploadFile,
-  UploadFilesByPath
+  UploadFilesByPath,
+  GetMessages,
+  SendMessage,
+  ClearMessages,
+  GetMessageCount
 } from '../wailsjs/go/main/App'
 
 const shareDir = ref('D:\\共享')
@@ -27,6 +31,11 @@ const errorMessage = ref('')
 const successMessage = ref('')
 const isDragOver = ref(false)
 const isUploading = ref(false)
+const showMessageDialog = ref(false)
+const messages = ref([])
+const messageInput = ref('')
+const messageCount = ref(0)
+let messagePollTimer = null
 
 function handleDragEnter(e) {
   e.preventDefault()
@@ -67,6 +76,8 @@ onMounted(async () => {
       await handleDropFiles(files)
     }
   }, false)
+  
+  startMessagePoll()
 })
 
 onUnmounted(() => {
@@ -74,6 +85,7 @@ onUnmounted(() => {
   document.removeEventListener('dragleave', handleDragLeave)
   document.removeEventListener('dragover', handleDragOver)
   OnFileDropOff()
+  stopMessagePoll()
 })
 
 async function handleSelectFolder() {
@@ -172,6 +184,46 @@ async function handleDropFiles(files) {
     isUploading.value = false
   }
 }
+
+function startMessagePoll() {
+  loadMessages()
+  messagePollTimer = setInterval(loadMessages, 3000)
+}
+
+function stopMessagePoll() {
+  if (messagePollTimer) {
+    clearInterval(messagePollTimer)
+    messagePollTimer = null
+  }
+}
+
+async function loadMessages() {
+  try {
+    const data = await GetMessages()
+    messages.value = JSON.parse(data)
+    messageCount.value = await GetMessageCount()
+  } catch (e) {}
+}
+
+async function handleSendMessage() {
+  if (!messageInput.value.trim()) return
+  await SendMessage(messageInput.value.trim())
+  messageInput.value = ''
+  await loadMessages()
+}
+
+async function handleClearMessages() {
+  await ClearMessages()
+  await loadMessages()
+}
+
+function openMessageDialog() {
+  showMessageDialog.value = true
+}
+
+function closeMessageDialog() {
+  showMessageDialog.value = false
+}
 </script>
 
 <template>
@@ -213,6 +265,12 @@ async function handleDropFiles(files) {
         <h1 class="title">局域网文件共享</h1>
         <p class="subtitle">支持二维码和链接分享</p>
       </div>
+      <button class="msg-icon-btn" @click="openMessageDialog">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+        </svg>
+        <span v-if="messageCount > 0" class="msg-badge">{{ messageCount > 99 ? '99+' : messageCount }}</span>
+      </button>
       <div class="status-badge" :class="{ 'status-active': isSharing }">
         <div class="status-dot" :class="{ 'dot-active': isSharing }"></div>
         <span>{{ statusMessage }}</span>
@@ -315,6 +373,40 @@ async function handleDropFiles(files) {
     <div v-if="errorMessage" class="error-message">
       {{ errorMessage }}
     </div>
+
+    <Transition name="dialog">
+      <div v-if="showMessageDialog" class="dialog-overlay" @click.self="closeMessageDialog">
+        <div class="dialog-content">
+          <div class="dialog-header">
+            <h3>📢 消息板</h3>
+            <button class="dialog-close" @click="closeMessageDialog">×</button>
+          </div>
+          <div class="dialog-body">
+            <div class="message-list">
+              <div v-if="messages.length === 0" class="no-messages">
+                暂无消息
+              </div>
+              <div v-for="(msg, idx) in messages" :key="idx" class="message-item" :class="{ 'is-sharer': msg.isSharer }">
+                <span class="msg-sender">{{ msg.sender }}</span>
+                <span class="msg-content">{{ msg.content }}</span>
+                <span class="msg-time">{{ msg.timestamp }}</span>
+              </div>
+            </div>
+          </div>
+          <div class="dialog-footer">
+            <input
+              type="text"
+              class="msg-input"
+              v-model="messageInput"
+              placeholder="输入消息..."
+              @keyup.enter="handleSendMessage"
+            />
+            <button class="msg-send-btn" @click="handleSendMessage">发送</button>
+            <button class="msg-clear-btn" @click="handleClearMessages">清空</button>
+          </div>
+        </div>
+      </div>
+    </Transition>
   </div>
 </template>
 
@@ -770,5 +862,213 @@ async function handleDropFiles(files) {
     opacity: 1;
     transform: translateX(-50%) translateY(0);
   }
+}
+
+.msg-icon-btn {
+  position: relative;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #6b7280;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+
+.msg-icon-btn:hover {
+  background: #f0f3ff;
+  color: #4f6ef7;
+}
+
+.msg-badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  background: #ef4444;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.dialog-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.4);
+  z-index: 300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.dialog-content {
+  width: 340px;
+  max-height: 380px;
+  background: #ffffff;
+  border-radius: 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.dialog-header {
+  padding: 12px 16px;
+  border-bottom: 1px solid #e8ecf3;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.dialog-header h3 {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1a1a2e;
+}
+
+.dialog-close {
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: none;
+  color: #9ca3af;
+  font-size: 18px;
+  cursor: pointer;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.dialog-close:hover {
+  background: #f3f4f6;
+  color: #374151;
+}
+
+.dialog-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+}
+
+.message-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.no-messages {
+  text-align: center;
+  color: #9ca3af;
+  font-size: 12px;
+  padding: 20px;
+}
+
+.message-item {
+  padding: 8px 10px;
+  background: #f8fafc;
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.message-item.is-sharer {
+  background: #f0f3ff;
+}
+
+.msg-sender {
+  font-size: 11px;
+  font-weight: 600;
+  color: #4f6ef7;
+}
+
+.msg-content {
+  font-size: 12px;
+  color: #374151;
+  word-break: break-all;
+}
+
+.msg-time {
+  font-size: 10px;
+  color: #9ca3af;
+  align-self: flex-end;
+}
+
+.dialog-footer {
+  padding: 12px;
+  border-top: 1px solid #e8ecf3;
+  display: flex;
+  gap: 6px;
+}
+
+.msg-input {
+  flex: 1;
+  padding: 8px 10px;
+  border: 1px solid #e2e5ec;
+  border-radius: 6px;
+  font-size: 12px;
+  outline: none;
+}
+
+.msg-input:focus {
+  border-color: #4f6ef7;
+}
+
+.msg-send-btn {
+  padding: 8px 12px;
+  border: none;
+  border-radius: 6px;
+  background: #4f6ef7;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.msg-send-btn:hover {
+  background: #4358d9;
+}
+
+.msg-clear-btn {
+  padding: 8px 10px;
+  border: 1px solid #e2e5ec;
+  border-radius: 6px;
+  background: #fff;
+  color: #6b7280;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.msg-clear-btn:hover {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #dc2626;
+}
+
+.dialog-enter-active,
+.dialog-leave-active {
+  transition: opacity 0.2s ease;
+}
+
+.dialog-enter-from,
+.dialog-leave-to {
+  opacity: 0;
 }
 </style>
